@@ -22,6 +22,20 @@ It reflects the refactored implementation used in `sample-backend` and is intend
     - [Resume (`POST /api/subscription/resume`)](#resume-post-apisubscriptionresume)
   - [Webhook Processing](#webhook-processing)
   - [Scheduled Downgrade Job](#scheduled-downgrade-job)
+  - [Discount System](#discount-system)
+    - [Discount Code Layout](#discount-code-layout)
+    - [Discount States](#discount-states)
+    - [Discount Creation Flow](#discount-creation-flow)
+    - [Discount Attachment to Checkout](#discount-attachment-to-checkout)
+    - [Discount Webhook Reconciliation](#discount-webhook-reconciliation)
+    - [Discount Cleanup and Reconciliation Jobs](#discount-cleanup-and-reconciliation-jobs)
+    - [Complete Discount Code Sections](#complete-discount-code-sections)
+      - [1) Discount creation orchestration](#1-discount-creation-orchestration)
+      - [2) Discount checkout attachment](#2-discount-checkout-attachment)
+      - [3) Discount lifecycle transitions](#3-discount-lifecycle-transitions)
+      - [4) Discount webhook reconciliation](#4-discount-webhook-reconciliation)
+      - [5) Discount integration in checkout creation](#5-discount-integration-in-checkout-creation)
+      - [6) Discount webhook integration](#6-discount-webhook-integration)
   - [Complete Code Sections](#complete-code-sections)
     - [1) Upgrade controller orchestration](#1-upgrade-controller-orchestration)
     - [2) Trial change logic (service)](#2-trial-change-logic-service)
@@ -48,6 +62,18 @@ Use these files as the source of truth:
 - `sample-backend/src/modules/subscription/subscription.constants.js`
 - `sample-backend/src/modules/webhook/webhook.controller.js`
 - `sample-backend/src/services/scheduledDowngrade.js`
+
+**Discount system files:**
+- `sample-backend/src/modules/discount/discount.constants.js`
+- `sample-backend/src/modules/discount/discount.lifecycle.js`
+- `sample-backend/src/modules/discount/discount.eligibility.js`
+- `sample-backend/src/modules/discount/discount.polar.js`
+- `sample-backend/src/modules/discount/discount.persistence.js`
+- `sample-backend/src/modules/discount/discount.orchestrator.js`
+- `sample-backend/src/modules/discount/discount.checkout.js`
+- `sample-backend/src/modules/discount/discount.reconciliation.js`
+- `sample-backend/src/modules/discount/discount.reconciliation.job.js`
+- `sample-backend/src/services/discountService.js`
 
 If `legacy-backend/` also exists in this repo, treat it as legacy/mirror unless explicitly chosen as runtime target.
 
@@ -247,6 +273,430 @@ Cancellation triggers:
 - soft cancel
 - resume
 - upgrade path that invalidates previously scheduled downgrade
+
+---
+
+## Discount System
+
+The discount system provides user-specific, single-use discounts that are automatically applied at checkout. Discounts are created in Polar.sh and tracked locally for eligibility, lifecycle management, and reconciliation.
+
+### Discount Code Layout
+
+Core discount modules:
+
+- `sample-backend/src/modules/discount/discount.constants.js` - Status constants and transition rules
+- `sample-backend/src/modules/discount/discount.lifecycle.js` - Idempotent status transitions
+- `sample-backend/src/modules/discount/discount.eligibility.js` - Eligibility checks
+- `sample-backend/src/modules/discount/discount.polar.js` - Polar API adapter
+- `sample-backend/src/modules/discount/discount.persistence.js` - Database operations
+- `sample-backend/src/modules/discount/discount.orchestrator.js` - Main orchestration
+- `sample-backend/src/modules/discount/discount.checkout.js` - Checkout attachment helpers
+- `sample-backend/src/modules/discount/discount.reconciliation.js` - Webhook reconciliation
+- `sample-backend/src/modules/discount/discount.reconciliation.job.js` - Periodic reconciliation
+- `sample-backend/src/services/discountService.js` - Main entry point (backward compatible)
+
+### Discount States
+
+Supported discount status values:
+
+- `active`: Discount is valid and can be used
+- `used`: Discount was applied to a payment
+- `expired`: Discount passed its expiration date
+- `revoked`: Discount was manually revoked
+- `failed`: Discount creation in Polar failed
+
+**Final states** (cannot transition to other states):
+- `used`, `expired`, `revoked`, `failed`
+
+**Valid transitions:**
+
+File: `documentation-only (conceptual state flow)`
+```text
+active -> used (via order.paid or reconciliation)
+active -> expired (via timeout or reconciliation)
+active -> revoked (via manual revoke or reconciliation)
+active -> failed (via Polar creation failure)
+```
+
+**Transition sources:**
+- `checkout_attach`: Discount attached to checkout
+- `order_paid`: Payment completed with discount
+- `timeout_expiry`: Discount expired naturally
+- `manual_revoke`: Manually revoked
+- `polar_failure`: Polar API failure
+- `reconciliation`: Periodic reconciliation job
+
+### Discount Creation Flow
+
+**High-level path:**
+
+1. Check eligibility (user not on target plan, marketing consent, no active/recent discount, cooldown period respected)
+2. Create Polar discount first (with `max_redemptions: 1`, `duration: "once"`, `restrict_to` product IDs)
+3. Create local database record
+4. Send email notification (if enabled)
+5. Handle compensation: if Polar succeeds but DB fails, log for reconciliation
+
+**Eligibility checks:**
+- User must not already be on target plan
+- User must have marketing consent (or be legacy user)
+- No active discount exists
+- No recent discount within cooldown period (default: 30 days)
+- Business rules (e.g., minimum usage for `usage_limit_reached` trigger)
+
+**Discount triggers:**
+- `usage_limit_reached`: User hit a feature limit
+- `locked_feature_accessed`: User accessed locked feature
+- `upgrade_flow_abandoned`: User started but didn't complete upgrade
+- `inactivity_after_usage`: User was active last period, inactive this period
+
+### Discount Attachment to Checkout
+
+**Flow:**
+
+1. Resolve applicable discount for selected plan using `resolveApplicableDiscount()`
+2. Check if discount applies to selected plan (via `restrict_to` in Polar)
+3. Build checkout metadata with `discountId` mapping
+4. Attach discount to Polar checkout via `discount_id` parameter
+5. Handle exhausted discount retry: if Polar returns `discount_usage_limit_exceeded`, mark discount as used and retry without discount
+
+**Deterministic mapping:**
+- Internal `discountId` (MongoDB ObjectId) stored in checkout `metadata.discountId`
+- Polar `discount_id` passed to `createPolarCheckout()`
+- Both paths reconciled in webhook processing
+
+### Discount Webhook Reconciliation
+
+**When `order.paid` webhook is received:**
+
+1. Extract discount identifiers:
+   - Internal `discountId` from `metadata.discountId`
+   - Polar `discount_id` from `data.discount_id`
+2. Reconcile via `reconcileDiscountUsage()`:
+   - Try internal `discountId` first (most reliable)
+   - Fallback to Polar `discount_id` if needed
+   - Idempotent: if discount already finalized, return success without action
+3. Mark discount as used via lifecycle manager
+4. Track analytics event
+
+**Idempotency guarantees:**
+- Safe to call multiple times with same inputs
+- Already-finalized discounts return success without state change
+- Race conditions handled via atomic status transitions
+
+### Discount Cleanup and Reconciliation Jobs
+
+**Expired discount cleanup:**
+- Scheduled: Daily at 2 AM
+- Task: `discount-expiry`
+- Function: `markExpiredDiscounts()`
+- Behavior: Finds active discounts past `expiresAt`, transitions to `expired` status
+
+**Periodic reconciliation:**
+- Scheduled: Weekly on Sundays
+- Task: `discount-reconciliation`
+- Function: `runDiscountReconciliation()`
+- Behavior: Detects drift between local and Polar state, reconciles expired discounts
+
+**Note:** Discounts are not deleted when expired — they remain in database with `expired` status for audit trail. Only deleted when user account is permanently deleted.
+
+### Complete Discount Code Sections
+
+#### 1) Discount creation orchestration
+
+File: `sample-backend/src/modules/discount/discount.orchestrator.js`
+```javascript
+export async function evaluateAndCreateDiscount(userId, trigger, context = {}) {
+  if (!config.discount?.enabled) {
+    return { created: false, reason: "system_disabled" };
+  }
+
+  // Check eligibility
+  const eligibilityResult = await checkEligibility(userId, trigger, context);
+  if (!eligibilityResult.eligible) {
+    return { created: false, reason: eligibilityResult.reason };
+  }
+
+  // Check for existing active discount (race condition guard)
+  const existingActive = await getActiveDiscount(userId);
+  if (existingActive) {
+    return { created: false, reason: "already_exists", discount: existingActive };
+  }
+
+  const rule = getDiscountRule(trigger);
+  const targetPlan = rule.targetPlan || "pro";
+  const percentOff = rule.percentOff ?? 20;
+  const expiresAt = calculateExpirationDate(DISCOUNT_VALIDITY_DAYS);
+
+  // Step 1: Create Polar discount first
+  let paymentDiscountId;
+  try {
+    paymentDiscountId = await createPolarDiscountWithMetadata({
+      percentOff,
+      targetPlan,
+      expiresAt,
+      description: `User discount: ${trigger} (${percentOff}% off ${targetPlan})`,
+      userId,
+      trigger,
+      version: "1.0"
+    });
+  } catch (err) {
+    return { created: false, reason: "polar_discount_failed" };
+  }
+
+  // Step 2: Create DB record
+  let discount;
+  try {
+    discount = await createDiscountRecord({
+      userId,
+      paymentProvider: "polar",
+      paymentDiscountId,
+      trigger,
+      targetPlan,
+      discountType: rule.percentOff ? "percent_off" : "amount_off",
+      discountValue: percentOff,
+      expiresAt,
+      status: DISCOUNT_STATUS_ACTIVE,
+      metadata: context
+    });
+  } catch (err) {
+    // Compensation: Polar discount exists but DB failed
+    logger.error({ userId, trigger, paymentDiscountId, err }, "DB creation failed after Polar success");
+    return { created: false, reason: "creation_failed", polarDiscountId: paymentDiscountId };
+  }
+
+  // Step 3: Send email notification
+  if (paymentDiscountId && discount.status === DISCOUNT_STATUS_ACTIVE) {
+    try {
+      const user = await User.findById(userId).select("email name").lean();
+      if (user?.email) {
+        const { html, text, subject } = discountOfferEmail(user, trigger, rule, context);
+        await enqueueEmailEvent({
+          eventId: `discount-offer:${userId}:${discount._id}`,
+          type: "discount-offer",
+          to: user.email,
+          subject,
+          text,
+          html
+        });
+      }
+    } catch (err) {
+      logger.warn({ userId, discountId: discount._id, err }, "Failed to send discount email");
+    }
+  }
+
+  return { created: true, discount };
+}
+```
+
+#### 2) Discount checkout attachment
+
+File: `sample-backend/src/modules/discount/discount.checkout.js`
+```javascript
+export async function resolveApplicableDiscount(userId, selectedPlan) {
+  const activeDiscount = await getActiveDiscount(userId);
+
+  if (!activeDiscount) {
+    return { discount: null, discountId: null, shouldAttach: false };
+  }
+
+  // Discount is restricted to its target plan in Polar (restrict_to)
+  const discountAppliesToSelectedPlan = String(activeDiscount.targetPlan) === String(selectedPlan);
+
+  if (!discountAppliesToSelectedPlan) {
+    return { discount: activeDiscount, discountId: null, shouldAttach: false };
+  }
+
+  const paymentDiscountId = activeDiscount.paymentDiscountId || null;
+  if (!paymentDiscountId) {
+    return { discount: activeDiscount, discountId: null, shouldAttach: false };
+  }
+
+  return {
+    discount: activeDiscount,
+    discountId: paymentDiscountId,
+    shouldAttach: true
+  };
+}
+
+export async function handleExhaustedDiscountRetry(err, userId, discount) {
+  const code = err?.payload?.error?.code;
+  if (code === "discount_usage_limit_exceeded" && discount?._id) {
+    await markDiscountUsedSafe(userId, discount._id.toString(), DISCOUNT_TRANSITION_SOURCE.CHECKOUT_ATTACH);
+    return { shouldRetry: true, retryDiscountId: null };
+  }
+  return { shouldRetry: false, retryDiscountId: null };
+}
+```
+
+#### 3) Discount lifecycle transitions
+
+File: `sample-backend/src/modules/discount/discount.lifecycle.js`
+```javascript
+export async function transitionDiscountStatus(discountId, toStatus, source, options = {}) {
+  const discount = await UserDiscount.findById(discountId);
+  if (!discount) return null;
+
+  const fromStatus = discount.status;
+
+  // No-op if already in target status
+  if (fromStatus === toStatus) return discount;
+
+  // Check if transition is valid
+  if (!isValidTransition(fromStatus, toStatus, source)) {
+    logger.warn({ discountId, fromStatus, toStatus, source }, "Invalid discount transition");
+    return null;
+  }
+
+  // Prevent transitions from final states
+  if (FINAL_DISCOUNT_STATUSES.includes(fromStatus)) {
+    return null;
+  }
+
+  const update = {
+    status: toStatus,
+    lastTransitionSource: source,
+    lastTransitionAt: new Date()
+  };
+
+  if (toStatus === DISCOUNT_STATUS_USED && !discount.usedAt) {
+    update.usedAt = new Date();
+  }
+
+  // Atomic update with status check
+  const updated = await UserDiscount.findOneAndUpdate(
+    { _id: discountId, status: fromStatus },
+    update,
+    { new: true }
+  );
+
+  return updated;
+}
+```
+
+#### 4) Discount webhook reconciliation
+
+File: `sample-backend/src/modules/discount/discount.reconciliation.js`
+```javascript
+export async function reconcileDiscountUsage(userId, discountId, polarDiscountId) {
+  // Try internal discountId first (most reliable)
+  if (discountId) {
+    try {
+      const marked = await markDiscountUsedSafe(
+        userId,
+        discountId,
+        DISCOUNT_TRANSITION_SOURCE.ORDER_PAID
+      );
+      if (marked) {
+        return { marked: true, discountId };
+      }
+    } catch (err) {
+      logger.warn({ userId, discountId, err }, "Failed to mark discount via internal ID");
+    }
+  }
+
+  // Fallback to Polar discount_id
+  if (polarDiscountId) {
+    try {
+      const existing = await getDiscountByPaymentId(userId, polarDiscountId);
+      if (existing) {
+        if (existing.status === DISCOUNT_STATUS_USED || existing.status === DISCOUNT_STATUS_EXPIRED) {
+          return { marked: false, discountId: existing._id.toString(), reason: "already_finalized" };
+        }
+      }
+
+      const marked = await markDiscountUsedByPaymentIdSafe(
+        userId,
+        polarDiscountId,
+        DISCOUNT_TRANSITION_SOURCE.ORDER_PAID
+      );
+      if (marked) {
+        const discount = await getDiscountByPaymentId(userId, polarDiscountId);
+        return { marked: true, discountId: discount?._id?.toString() || null };
+      }
+    } catch (err) {
+      logger.warn({ userId, polarDiscountId, err }, "Failed to mark discount via Polar ID");
+    }
+  }
+
+  return { marked: false, discountId: null, reason: discountId || polarDiscountId ? "reconciliation_failed" : "no_discount_ids" };
+}
+```
+
+#### 5) Discount integration in checkout creation
+
+File: `sample-backend/src/modules/subscription/subscription.payment.service.js`
+```javascript
+export async function createCheckoutForNewSubscription(
+  billingUserId,
+  customerId,
+  paidProductId,
+  targetPlanId,
+  interval,
+  userEmail,
+  userName
+) {
+  // Resolve applicable discount using centralized helper
+  const { discount: activeDiscount, discountId, shouldAttach } = await resolveApplicableDiscount(
+    billingUserId,
+    targetPlanId
+  );
+
+  // Build checkout metadata with discount ID mapping
+  const customData = buildCheckoutMetadata(billingUserId, targetPlanId, interval, activeDiscount);
+
+  const allowTrial = billingUser?.trialUsedAt == null;
+
+  let transaction;
+  try {
+    transaction = await createPolarCheckout({
+      customerId,
+      productId: paidProductId,
+      metadata: customData,
+      discountId: shouldAttach ? discountId : null,
+      allowTrial,
+      successUrl: `${config.app.frontendBaseUrl}/subscription?success=1`,
+      cancelUrl: `${config.app.frontendBaseUrl}/subscription?canceled=1`
+    });
+  } catch (err) {
+    // Handle exhausted discount retry using centralized helper
+    const retryResult = await handleExhaustedDiscountRetry(err, billingUserId, activeDiscount);
+    if (retryResult.shouldRetry) {
+      delete customData.discountId;
+      transaction = await createPolarCheckout({
+        customerId,
+        productId: paidProductId,
+        metadata: customData,
+        discountId: null,
+        allowTrial,
+        successUrl: `${config.app.frontendBaseUrl}/subscription?success=1`,
+        cancelUrl: `${config.app.frontendBaseUrl}/subscription?canceled=1`
+      });
+    } else {
+      throw err;
+    }
+  }
+
+  return { checkoutUrl: transaction?.checkout_url || transaction?.url };
+}
+```
+
+#### 6) Discount webhook integration
+
+File: `sample-backend/src/modules/webhook/webhook.controller.js`
+```javascript
+// In order.paid handler:
+const discountId = customData?.discountId ?? null;
+const polarDiscountId = data?.discount_id ?? null;
+
+// Reconcile discount usage using unified helper (idempotent)
+const reconciliationResult = await reconcileDiscountUsage(userId, discountId, polarDiscountId);
+if (reconciliationResult.marked) {
+  analyticsTrack(userId, "coupon_used", {
+    discountId: reconciliationResult.discountId,
+    plan
+  });
+}
+```
 
 ---
 
@@ -629,6 +1079,7 @@ window.location.href = data.url;
 
 ## Invariants and Guarantees
 
+**Subscription invariants:**
 1. Only workspace owner can mutate billing state.
 2. Only one effective paid subscription is allowed per billing user.
 3. Trial plan changes always revoke the trial first.
@@ -636,6 +1087,16 @@ window.location.href = data.url;
 5. Cancel endpoint is soft cancel (`cancelled_at_period_end`), not revoke.
 6. Free plan selection is immediate revoke/reset.
 7. Webhook processing is idempotent and guarded against stale/revoked events.
+
+**Discount invariants:**
+1. Only one active discount per user (enforced by unique index).
+2. Discounts are single-use (`max_redemptions: 1`, `duration: "once"`).
+3. Discount status transitions are idempotent and race-safe.
+4. Discounts are restricted to target plan products in Polar (`restrict_to`).
+5. Discount eligibility respects cooldown periods (default: 30 days).
+6. Discount creation requires Polar success before DB write (compensation path exists).
+7. Discount usage reconciliation handles both internal `discountId` and Polar `discount_id` paths.
+8. Expired discounts remain in database (status change, not deletion).
 
 ---
 
@@ -655,6 +1116,12 @@ Verify all cases before release:
 - [ ] Scheduled downgrade job executes and clears `nextPlan`
 - [ ] Credit `order.paid` events do not revert upgraded plan
 - [ ] Stale events do not reactivate revoked subscriptions
+- [ ] Discount creation: eligibility checks, Polar creation, DB persistence
+- [ ] Discount attachment: applies only to matching target plan
+- [ ] Discount exhausted retry: marks as used and retries checkout
+- [ ] Discount webhook reconciliation: handles both internal and Polar discount IDs
+- [ ] Discount expiry cleanup: marks expired discounts
+- [ ] Discount reconciliation job: detects and reconciles state drift
 
 ---
 
@@ -667,8 +1134,13 @@ Verify all cases before release:
 5. Cancel scheduled jobs when state changes invalidate them.
 6. Keep `trialUsedAt` accurate; it controls `allowTrial` in checkout.
 7. In canonical response helpers, compare `current_plan.name` to `"free"` (not object-to-string checks).
+8. Discount transitions must use lifecycle manager for idempotency.
+9. Discount eligibility checks must run before Polar creation.
+10. Discount attachment must verify `restrict_to` matches selected plan.
+11. Discount reconciliation must handle both `discountId` and `discount_id` paths.
+12. Expired discounts are marked as expired (status change), not deleted.
 
 ---
 
-**Last Updated:** February 2026  
-**Version:** 2.1
+**Last Updated:** February 2026
+**Version:** 2.2
