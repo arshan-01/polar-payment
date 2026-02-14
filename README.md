@@ -1,671 +1,665 @@
 # Subscription & Payment System Documentation
 
-This document provides a comprehensive guide to the subscription and payment system, including all edge cases, webhook handling, and state management logic.
+This is the maintained reference for current subscription behavior and code structure.
+It reflects the refactored implementation used in `sample-backend` and is intended for future updates.
 
 ## Table of Contents
 
-1. [Subscription States](#subscription-states)
-2. [Plan Hierarchy](#plan-hierarchy)
-3. [Upgrade Flow](#upgrade-flow)
-4. [Downgrade Flow](#downgrade-flow)
-5. [Trial Management](#trial-management)
-6. [Webhook Processing](#webhook-processing)
-7. [Credit Webhook Detection](#credit-webhook-detection)
-8. [Scheduled Downgrades](#scheduled-downgrades)
-9. [State Machine Logic](#state-machine-logic)
-10. [Edge Cases & Solutions](#edge-cases--solutions)
+- [Subscription \& Payment System Documentation](#subscription--payment-system-documentation)
+  - [Table of Contents](#table-of-contents)
+  - [Canonical Code Layout](#canonical-code-layout)
+  - [Client Architecture and Structure](#client-architecture-and-structure)
+    - [Main client file](#main-client-file)
+    - [Client state model](#client-state-model)
+    - [Client request flow](#client-request-flow)
+  - [Subscription States](#subscription-states)
+  - [Behavior Matrix](#behavior-matrix)
+  - [Upgrade Flow](#upgrade-flow)
+    - [High-level path](#high-level-path)
+    - [Notes](#notes)
+  - [Cancel and Resume Flows](#cancel-and-resume-flows)
+    - [Cancel (`POST /api/subscription/cancel`)](#cancel-post-apisubscriptioncancel)
+    - [Resume (`POST /api/subscription/resume`)](#resume-post-apisubscriptionresume)
+  - [Webhook Processing](#webhook-processing)
+  - [Scheduled Downgrade Job](#scheduled-downgrade-job)
+  - [Complete Code Sections](#complete-code-sections)
+    - [1) Upgrade controller orchestration](#1-upgrade-controller-orchestration)
+    - [2) Trial change logic (service)](#2-trial-change-logic-service)
+    - [3) Paid downgrade scheduling (service)](#3-paid-downgrade-scheduling-service)
+    - [4) Soft cancel and resume (service)](#4-soft-cancel-and-resume-service)
+  - [Complete Client Code Sections](#complete-client-code-sections)
+    - [1) Client query and mutation setup](#1-client-query-and-mutation-setup)
+    - [2) Client derived subscription state](#2-client-derived-subscription-state)
+    - [3) Client upgrade action handling](#3-client-upgrade-action-handling)
+    - [4) Client cancel-resume-billing interactions](#4-client-cancel-resume-billing-interactions)
+  - [Invariants and Guarantees](#invariants-and-guarantees)
+  - [Testing Checklist](#testing-checklist)
+  - [Known Pitfalls](#known-pitfalls)
+
+---
+
+## Canonical Code Layout
+
+Use these files as the source of truth:
+
+- `sample-backend/src/modules/subscription/subscription.controller.js`
+- `sample-backend/src/modules/subscription/subscription.payment.service.js`
+- `sample-backend/src/modules/subscription/subscription.persistence.js`
+- `sample-backend/src/modules/subscription/subscription.constants.js`
+- `sample-backend/src/modules/webhook/webhook.controller.js`
+- `sample-backend/src/services/scheduledDowngrade.js`
+
+If `legacy-backend/` also exists in this repo, treat it as legacy/mirror unless explicitly chosen as runtime target.
+
+---
+
+## Client Architecture and Structure
+
+The subscription UI is driven from a single page component and a small subscription API client.
+
+### Main client file
+
+- `sample-frontend/src/pages/Subscription.tsx`
+- API methods imported from `@/api/subscription`:
+  - `fetchSubscriptionPlans`
+  - `fetchCurrentSubscription`
+  - `fetchSubscriptionUsage`
+  - `upgradeSubscription`
+  - `createBillingPortal`
+  - `resumeSubscription`
+
+### Client state model
+
+The client normalizes backend payloads to support both canonical and legacy shapes:
+
+- `current_plan` or `plan`
+- `subscription_status` or `status`
+- `next_plan` or `nextPlan`
+- `current_period_end` or `currentPeriodEnd`
+- `billing_interval` or `interval`
+- `trialing_ends_at`
+- `trial_used_at`
+- `active_discount`
+
+### Client request flow
+
+1. Load plans (`subscription/plans`), current state (`subscription/current`), and usage (`subscription/usage`) via React Query.
+2. User action on plan card triggers `upgradeSubscription(plan, interval)`.
+3. Client branches on response:
+   - `checkoutUrl` -> redirect to checkout
+   - `nextPlan/currentPlan` -> show scheduled downgrade success message
+   - otherwise -> show generic success
+4. Resume action calls `resumeSubscription`.
+5. Billing actions call `createBillingPortal` and redirect to returned `url`.
+6. On successful mutations, invalidate `["subscription"]` and refresh auth session.
 
 ---
 
 ## Subscription States
 
-The system supports the following subscription states:
+Supported status values:
 
-- **`active`**: Active paid subscription
-- **`trialing`**: User is on a trial period (no charge)
-- **`cancelled_at_period_end`**: Subscription is cancelled but remains active until period ends
-- **`free`**: No active subscription (revoked or never subscribed)
-- **`expired`**: Subscription has expired
+- `active`: paid subscription is active
+- `trialing`: trial is active and not charged yet
+- `cancelled_at_period_end`: cancellation scheduled, access still active
+- `free`: no effective paid subscription
+- `expired`: subscription ended
 
-### State Transitions
+Common transitions:
 
-```
-free → trialing → active (trial conversion)
-free → active (direct subscription)
-active → cancelled_at_period_end → free (cancellation)
-active → active (plan change)
-trialing → free (trial revoked)
+```text
+free -> trialing -> active
+free -> active
+active -> cancelled_at_period_end -> free
+trialing -> free (trial revoked)
+active -> active (paid upgrade/same-tier change)
 ```
 
 ---
 
-## Plan Hierarchy
+## Behavior Matrix
 
-Plans are ordered by tier for upgrade/downgrade detection:
+Current backend behavior:
 
-```javascript
-const PLAN_HIERARCHY = {
-  free: 0,
-  pro: 1,
-  plus: 2,
-  agency: 3
-};
-```
-
-**Key Rules:**
-- Higher tier = more expensive plan
-- Upgrades: `targetTier > currentTier`
-- Downgrades: `targetTier < currentTier`
-- Same tier: Interval change (monthly ↔ yearly)
+| Scenario | Expected Behavior | Proration |
+|---|---|---|
+| Trialing -> Upgrade (different plan) | Trial revoked immediately, user reset to free, new checkout created | No proration call |
+| Trialing -> Downgrade (different plan) | Same as above: revoke + checkout | No proration call |
+| Trialing -> Same Plan | Rejected with validation error | N/A |
+| Paid -> Upgrade | Immediate Polar subscription update | Yes (`proration_behavior: "invoice"`) |
+| Paid -> Downgrade | Deferred: store `nextPlan`, schedule job for period end | No immediate proration |
+| Paid -> Same Tier (interval switch) | Immediate Polar update | Yes (`invoice`) |
+| Any Paid/Trial -> Free | Immediate revoke/reset to free | No scheduling |
+| Cancel Endpoint | Soft cancel at next billing period | No immediate plan removal |
+| Resume Endpoint | Uncancel, restore `active` or `trialing` | N/A |
 
 ---
 
 ## Upgrade Flow
 
-### Paid-to-Paid Upgrade (e.g., Pro → Plus)
+### High-level path
 
-**Immediate Upgrade with Proration:**
-1. User requests upgrade via `/api/subscription/upgrade`
-2. System calls Polar API to update subscription immediately
-3. Polar applies proration (charges for new plan, credits for old plan)
-4. Webhooks arrive:
-   - `subscription.updated` → Updates subscription details
-   - `order.paid` (charge) → New plan charge → **Updates plan to Plus**
-   - `order.paid` (credit) → Old plan refund → **Must be ignored** (see Credit Detection)
+1. Validate billing context and ownership.
+2. Validate requested plan and interval.
+3. Load current subscription.
+4. Determine change direction (upgrade/downgrade/same-tier).
+5. Handle free plan switch immediately if requested.
+6. Resolve product ID for paid plans.
+7. If user is trialing and changing to a different plan:
+   - revoke trial immediately
+   - reset local state to free
+   - create new checkout
+8. If user has effective paid subscription:
+   - paid upgrade: immediate Polar update with proration
+   - paid downgrade: set `nextPlan`, schedule job at period end
+   - same-tier change: immediate Polar update with proration
+9. If no effective paid subscription: create checkout.
 
-**Key Points:**
-- Upgrade happens immediately
-- Proration is handled by Polar
-- Credit webhook must NOT downgrade the plan
+### Notes
 
-### Trial → Paid Upgrade
-
-**Different Plan:**
-1. User on trial (e.g., Pro trial) upgrades to different plan (e.g., Plus)
-2. System revokes the trial subscription
-3. Sets user to `free` status
-4. Creates new subscription via checkout
-5. User completes checkout → New paid subscription created
-
-**Same Plan:**
-- User cannot "upgrade" to the same plan they're trialing
-- System returns error: "You are already on this plan. Your trial will automatically convert to paid when it ends."
+- Trial transitions do not use in-place `updatePolarSubscription`.
+- Paid downgrade does not update Polar immediately.
+- Paid upgrade and same-tier change use immediate Polar PATCH.
 
 ---
 
-## Downgrade Flow
+## Cancel and Resume Flows
 
-### Paid-to-Paid Downgrade (e.g., Plus → Pro)
+### Cancel (`POST /api/subscription/cancel`)
 
-**Scheduled Downgrade (No Proration):**
-1. User requests downgrade via `/api/subscription/upgrade`
-2. System does NOT call Polar API immediately
-3. System stores `nextPlan` in database
-4. System schedules a job to run at `currentPeriodEnd`
-5. User keeps current plan until period ends
-6. At period end, scheduled job:
-   - Updates Polar subscription to new plan
-   - Updates local database
-   - Clears `nextPlan`
+1. Validate owner context.
+2. Require active `polarSubscriptionId`.
+3. Reject if already `cancelled_at_period_end`.
+4. Call Polar cancel with `effectiveFrom: "next_billing_period"`.
+5. Update local status to `cancelled_at_period_end`, set `nextPlan` to free.
+6. Cancel any scheduled downgrade job.
 
-**Key Points:**
-- No immediate plan change
-- No proration (user keeps current plan until period ends)
-- Downgrade is deferred to end of billing period
+### Resume (`POST /api/subscription/resume`)
 
-### Free Plan (Revocation)
-
-- "Free" means revoking the subscription
-- Happens immediately (no scheduling)
-- Sets `polarSubscriptionId` to `null`
-- Sets status to `free`
-
----
-
-## Trial Management
-
-### Trial States
-
-**Active Trial:**
-- Status: `trialing`
-- Price: `0`
-- `trialingEndsAt`: End date of trial
-- `polarSubscriptionId`: Present
-
-**Cancelled Trial:**
-- Status: `cancelled_at_period_end` (if before trial ends)
-- Status: `free` (if after trial ends)
-- `trialingEndsAt`: Preserved if trial hasn't ended
-
-### Trial Conversion
-
-**Natural Conversion:**
-- Trial ends → `subscription.updated` webhook
-- Status changes: `trialing` → `active`
-- Price updates to plan price
-- `trialingEndsAt` cleared
-
-**Trial Cancellation:**
-- User cancels during trial
-- Status: `cancelled_at_period_end`
-- Trial continues until `trialingEndsAt`
-- After trial ends → Status: `free`
-
-**Trial Resume:**
-- User cancels trial, then resumes before trial ends
-- Status must restore to `trialing` (not `active`)
-- `trialingEndsAt` preserved
-- Price: `0`
-
-**Trial Plan Change:**
-- User on trial changes to different plan
-- Trial is revoked immediately
-- User set to `free`
-- New subscription created via checkout
+1. Validate owner context.
+2. Require `polarSubscriptionId`.
+3. Require local status `cancelled_at_period_end`.
+4. Uncancel in Polar (`cancel_at_period_end: false`), optionally restore product ID.
+5. Restore local state:
+   - `trialing` if trial end is still in the future
+   - otherwise `active`
+6. Clear `nextPlan`.
+7. Cancel scheduled downgrade job.
 
 ---
 
 ## Webhook Processing
 
-### Webhook Event Types
+Handled event families:
 
-The system processes the following Polar.sh webhooks:
+- `order.paid`
+- `subscription.created`
+- `subscription.updated`
+- `subscription.active`
+- `subscription.canceled` / `subscription.cancelled`
+- `subscription.uncanceled`
+- `subscription.revoked`
 
-1. **`order.paid`**: Payment recorded
-2. **`subscription.created`**: New subscription created
-3. **`subscription.updated`**: Subscription updated
-4. **`subscription.active`**: Subscription activated
-5. **`subscription.canceled`**: Subscription cancelled (at period end)
-6. **`subscription.uncanceled`**: Cancellation reversed
-7. **`subscription.revoked`**: Subscription revoked
+Core processing pipeline:
 
-### Webhook Processing Flow
+1. Verify signature.
+2. Apply idempotency gate.
+3. Resolve user and derive plan/price/interval/period end.
+4. Build next state with `buildNextSubscriptionState`.
+5. Validate invariants with `validateSubscriptionState`.
+6. Write state atomically.
+7. Mark event processed.
 
-```
-1. Verify webhook signature
-2. Check idempotency (prevent duplicate processing)
-3. Extract user ID from metadata or customer lookup
-4. Get current subscription state from database
-5. Build next state using state machine
-6. Validate state invariants
-7. Update database atomically
-8. Mark webhook as processed
-```
+Credit/rollback guard during upgrades:
 
-### State Machine
+- `order.paid` refunds/credits must not roll plan backward.
+- Downgrade-like webhook during an upgrade path is treated as credit and does not overwrite upgraded state.
 
-The `buildNextSubscriptionState()` function is the single source of truth for state transitions. It takes:
-- Current state (from database)
-- Event type (webhook type)
-- Event data (webhook payload)
-- Derived values (plan, price, interval, etc.)
+Revoked subscription guard:
 
-And returns the next valid state.
+- If local state is already revoked (`free`) and webhook refers to old subscription IDs, event is ignored.
 
 ---
 
-## Credit Webhook Detection
+## Scheduled Downgrade Job
 
-### Problem
+Scheduling utility:
 
-When upgrading (e.g., Pro → Plus), Polar sends multiple `order.paid` webhooks:
-1. **Charge webhook**: New plan (Plus) with positive amount
-2. **Credit webhook**: Old plan (Pro) with negative amount OR positive amount for refund
+- `sample-backend/src/services/scheduledDowngrade.js`
+- Job ID format: `scheduled-downgrade-{userId}`
 
-Without detection, the credit webhook would incorrectly downgrade the plan back to Pro.
+When scheduling:
 
-### Solution
+1. Save `nextPlan` in DB.
+2. Schedule job for `currentPeriodEnd`.
 
-Credit webhooks are detected using two methods:
+Worker behavior:
+
+1. Re-read current subscription and period end.
+2. If period has not ended yet, re-schedule.
+3. If ended, update Polar to next plan.
+4. Update local plan and clear `nextPlan`.
+
+Cancellation triggers:
+
+- immediate revoke to free
+- soft cancel
+- resume
+- upgrade path that invalidates previously scheduled downgrade
+
+---
+
+## Complete Code Sections
+
+These code sections are intentionally complete for core flow maintenance.
+
+### 1) Upgrade controller orchestration
 
 ```javascript
-const isCredit = 
-  (webhookPrice !== null && webhookPrice < 0) ||  // Negative amount
-  (isDowngrade && existingPlanName !== null);     // Downgrade webhook
+const upgrade = asyncHandler(async (req, res) => {
+  const { billingUserId, isSharedContext } = await resolveBillingContext(req);
+  if (isSharedContext || String(billingUserId) !== String(req.user._id)) {
+    throw new AppError("Only the workspace owner can change subscription", StatusCodes.FORBIDDEN);
+  }
+
+  const { interval } = validatePlanChangeInput(req.body.plan, req.body.interval, plans);
+
+  const existingSubscription = await Subscription.findOne({ userId: billingUserId }).lean();
+  const currentPlanName = getPlanName(existingSubscription?.plan) || "free";
+  const currentStatus = existingSubscription?.status || "active";
+
+  const { isUpgrade, isDowngrade } = computePlanChangeDirection(currentPlanName, req.body.plan);
+  const hasEffectivePolarSub = hasEffectivePolarSubscription(existingSubscription, currentStatus, currentPlanName);
+
+  if (req.body.plan === "free") {
+    const result = await handleSwitchToFree(billingUserId, existingSubscription, hasEffectivePolarSub);
+    return ok(res, result.data, result.message);
+  }
+
+  const paidProductId = getPaidProductId(req.body.plan, interval);
+  if (!paidProductId) {
+    throw new AppError("Polar product is not configured", StatusCodes.INTERNAL_SERVER_ERROR);
+  }
+
+  const { trialingRevoked } = await handleTrialToPaidTransition(
+    billingUserId,
+    currentStatus,
+    currentPlanName,
+    req.body.plan,
+    existingSubscription
+  );
+
+  if (!trialingRevoked && hasEffectivePolarSub && existingSubscription?.polarSubscriptionId) {
+    const subId = existingSubscription.polarSubscriptionId;
+
+    if (String(currentStatus) === "active" && isUpgrade) {
+      const result = await handlePaidUpgrade(billingUserId, subId, paidProductId, req.body.plan, interval);
+      return ok(res, result.data, result.message);
+    }
+
+    if (String(currentStatus) === "active" && isDowngrade) {
+      const result = await handlePaidDowngrade(
+        billingUserId,
+        existingSubscription,
+        paidProductId,
+        req.body.plan,
+        interval,
+        currentPlanName
+      );
+      return ok(res, result.data, result.message);
+    }
+
+    const result = await handleSameTierChange(billingUserId, subId, paidProductId, req.body.plan, interval);
+    return ok(res, result.data, result.message);
+  }
+
+  const customerId = await ensurePolarCustomer(billingUserId, req.user.email, req.user.name);
+  const { checkoutUrl } = await createCheckoutForNewSubscription(
+    billingUserId,
+    customerId,
+    paidProductId,
+    req.body.plan,
+    interval,
+    req.user.email,
+    req.user.name
+  );
+
+  return ok(res, { checkoutUrl }, "Checkout session created");
+});
 ```
 
-**Detection Logic:**
-1. **Negative Amount**: `webhookPrice < 0` → Credit/refund
-2. **Downgrade Webhook**: Incoming plan tier < current plan tier → Credit for old plan
-
-**When Credit Detected:**
-- Plan is NOT updated (preserved from current state)
-- Price is NOT updated (preserved from current state)
-- Only `polarTransactionId` and other metadata are updated
-
-### Example
-
-**User upgrades Pro → Plus:**
-- Charge webhook: Plus (tier 2), amount: +$79 → Updates plan to Plus ✅
-- Credit webhook: Pro (tier 1), amount: -$39 → Detected as credit, plan stays Plus ✅
-
----
-
-## Scheduled Downgrades
-
-### How It Works
-
-1. **Scheduling:**
-   - User requests downgrade
-   - System stores `nextPlan` in database
-   - System schedules BullMQ job with `executeAt = currentPeriodEnd`
-
-2. **Job Processing:**
-   - Job runs at period end
-   - Verifies period has actually ended (fetches from Polar if needed)
-   - If period not ended, reschedules job
-   - Updates Polar subscription to new plan
-   - Updates local database
-   - Clears `nextPlan`
-
-3. **Webhook Protection:**
-   - `order.paid` webhooks check for `nextPlan`
-   - If `nextPlan` exists and period hasn't ended, plan is preserved
-   - Prevents premature downgrade from webhooks
-
-### Job ID Format
+### 2) Trial change logic (service)
 
 ```javascript
-// Format: scheduled-downgrade-{userId}
-// Note: No colons (BullMQ requirement)
-const jobId = `scheduled-downgrade-${userId}`;
+export async function handleTrialToPaidTransition(
+  billingUserId,
+  currentStatus,
+  currentPlanName,
+  targetPlanId,
+  existingSubscription
+) {
+  if (String(currentStatus) !== "trialing" || !existingSubscription?.polarSubscriptionId) {
+    return { trialingRevoked: false };
+  }
+
+  if (String(currentPlanName) === String(targetPlanId)) {
+    throw new AppError(
+      "You are already on this plan. Your trial will automatically convert to paid when it ends.",
+      StatusCodes.BAD_REQUEST
+    );
+  }
+
+  const subId = existingSubscription.polarSubscriptionId;
+  try {
+    await revokePolarSubscription(subId);
+  } catch (err) {
+    if (err?.status !== 404) throw err;
+    logger.warn({ userId: billingUserId, subscriptionId: subId }, "Subscription not found in Polar when revoking trial");
+  }
+
+  await resetToFreePlan(billingUserId, { clearPolarIds: true });
+  await cancelScheduledDowngradeJob(billingUserId);
+  return { trialingRevoked: true };
+}
 ```
 
-### Cancellation
-
-Scheduled downgrade jobs are cancelled when:
-- User upgrades to a different plan
-- User resumes subscription
-- Subscription is revoked
-- User cancels subscription (soft cancel)
-
----
-
-## State Machine Logic
-
-### `buildNextSubscriptionState()` Function
-
-This function deterministically calculates the next subscription state based on:
-- Current state
-- Webhook event type
-- Webhook payload data
-
-**Key Principles:**
-1. **Idempotency**: Same input → Same output
-2. **Validation**: Invalid states are rejected
-3. **Preservation**: Fields not explicitly changed are preserved
-
-### State Transitions by Event
-
-#### `order.paid`
-
-**For Paid Plans:**
-- Updates plan (unless credit or scheduled downgrade)
-- Updates price (unless credit or trial)
-- Updates `polarTransactionId`
-- Updates `currentPeriodEnd`
-
-**For Trials:**
-- Price remains `0`
-- Status remains `trialing`
-- `trialingEndsAt` preserved
-
-**Credit Detection:**
-- Negative amount OR downgrade webhook → Preserve plan/price
-
-**Scheduled Downgrade:**
-- If `nextPlan` exists and period not ended → Preserve current plan
-
-#### `subscription.created`
-
-- Sets `polarSubscriptionId`
-- Sets plan from webhook
-- Sets status: `trialing` if trial detected, else `active`
-- Sets `trialingEndsAt` if trial
-
-#### `subscription.updated`
-
-**For Trialing:**
-- Preserves `trialingEndsAt`
-- Updates plan if changed
-- Status remains `trialing`
-
-**For Active:**
-- Updates plan if changed
-- Updates price
-- Status remains `active`
-
-#### `subscription.canceled`
-
-- Status: `cancelled_at_period_end`
-- Plan preserved
-- `nextPlan` set to `free` (if not already set)
-
-#### `subscription.uncanceled`
-
-**For Trials:**
-- If trial hasn't ended → Status: `trialing`, price: `0`
-- If trial ended → Status: `active`, price: plan price
-
-**For Active:**
-- Status: `active`
-- Price: plan price
-
-#### `subscription.revoked`
-
-- Status: `free`
-- Plan: `free`
-- `polarSubscriptionId`: `null`
-- All subscription fields cleared
-- Cancels scheduled downgrade jobs
-
----
-
-## Edge Cases & Solutions
-
-### 1. Credit Webhook Downgrading Plan
-
-**Problem:** Credit webhooks during upgrades were downgrading the plan.
-
-**Solution:** Detect credits by:
-- Negative amount, OR
-- Downgrade webhook (incoming tier < current tier)
-
-**Location:** `webhook.controller.js` - `buildNextSubscriptionState()`
-
-### 2. Scheduled Downgrade Overridden by Webhook
-
-**Problem:** `order.paid` webhooks were immediately applying scheduled downgrades.
-
-**Solution:** Check for `nextPlan` and preserve current plan if period hasn't ended.
-
-**Location:** `webhook.controller.js` - `buildNextSubscriptionState()`
-
-### 3. Trial Resume Setting Wrong Status
-
-**Problem:** Resuming cancelled trial set status to `active` instead of `trialing`.
-
-**Solution:** Check if `trialingEndsAt` is in future, restore to `trialing` if so.
-
-**Location:** 
-- `subscription.controller.js` - `resume()`
-- `webhook.controller.js` - `subscription.uncanceled` handler
-
-### 4. Stale `order.paid` Reactivating Revoked Subscription
-
-**Problem:** Delayed `order.paid` webhooks were reactivating revoked subscriptions.
-
-**Solution:** Check webhook event history for recent `subscription.revoked` events.
-
-**Location:** `webhook.controller.js` - `order.paid` handler
-
-### 5. BullMQ Job ID Invalid Character
-
-**Problem:** Job ID contained colon (`:`) which BullMQ doesn't allow.
-
-**Solution:** Changed format from `scheduled-downgrade:${userId}` to `scheduled-downgrade-${userId}`.
-
-**Location:** `services/scheduledDowngrade.js`
-
-### 6. Trial Plan Change Not Ending Trial
-
-**Problem:** Changing plan during trial was updating in-place instead of ending trial.
-
-**Solution:** Revoke trial, set to `free`, create new subscription via checkout.
-
-**Location:** `subscription.controller.js` - `upgrade()`
-
-### 7. Same Plan Trial "Upgrade"
-
-**Problem:** User could "upgrade" to same plan they're trialing.
-
-**Solution:** Check if current plan matches requested plan, return error.
-
-**Location:** `subscription.controller.js` - `upgrade()`
-
-### 8. Proration Behavior Not Supported
-
-**Problem:** Using `proration_behavior: "none"` which Polar doesn't support.
-
-**Solution:** Removed parameter, let Polar handle proration automatically.
-
-**Location:** `queues/workers.js` - `apply-scheduled-downgrade` worker
-
-### 9. Scheduled Downgrade Not Cancelled on Revocation
-
-**Problem:** Scheduled downgrade jobs weren't cancelled when subscription revoked.
-
-**Solution:** Call `cancelScheduledDowngradeJob()` in `subscription.revoked` handler.
-
-**Location:** `webhook.controller.js` - `subscription.revoked` handler
-
-### 10. Period End Stale in Database
-
-**Problem:** `currentPeriodEnd` in database could be stale or in past.
-
-**Solution:** Fetch from Polar API if database value is missing or invalid.
-
-**Location:** 
-- `subscription.controller.js` - `upgrade()` (downgrade scheduling)
-- `queues/workers.js` - `apply-scheduled-downgrade` worker
-
----
-
-## Database Schema
-
-### Subscription Model
+### 3) Paid downgrade scheduling (service)
 
 ```javascript
-{
-  userId: ObjectId,
-  plan: {
-    name: "pro" | "plus" | "agency" | "free",
-    productId: String  // Polar product ID
+export async function handlePaidDowngrade(
+  billingUserId,
+  existingSubscription,
+  paidProductId,
+  targetPlanId,
+  interval,
+  currentPlanName
+) {
+  let periodEnd = existingSubscription?.currentPeriodEnd ? new Date(existingSubscription.currentPeriodEnd) : null;
+  const now = new Date();
+
+  if (!periodEnd || periodEnd <= now) {
+    if (!existingSubscription?.polarSubscriptionId) {
+      throw new AppError("Cannot schedule downgrade without active subscription", StatusCodes.BAD_REQUEST);
+    }
+
+    try {
+      const polarSub = await getPolarSubscription(existingSubscription.polarSubscriptionId);
+      const polarPeriodEnd = polarSub?.current_period_end ? new Date(polarSub.current_period_end) : null;
+      if (polarPeriodEnd && polarPeriodEnd > now) {
+        periodEnd = polarPeriodEnd;
+        await updatePeriodEnd(billingUserId, polarPeriodEnd);
+      }
+    } catch (err) {
+      logger.warn(
+        { userId: billingUserId, subscriptionId: existingSubscription.polarSubscriptionId, err },
+        "Failed to fetch period end from Polar, using DB value"
+      );
+    }
+  }
+
+  if (!periodEnd || periodEnd <= now) {
+    throw new AppError("Cannot schedule downgrade: current billing period has ended or is invalid", StatusCodes.BAD_REQUEST);
+  }
+
+  const nextPlan = normalizePlan(targetPlanId, paidProductId, interval, getProductIdForPlan);
+  await setScheduledDowngrade(billingUserId, nextPlan, periodEnd);
+  return {
+    success: true,
+    message: "Downgrade scheduled for next billing cycle",
+    data: { currentPlan: currentPlanName, nextPlan: targetPlanId }
+  };
+}
+```
+
+### 4) Soft cancel and resume (service)
+
+```javascript
+export async function handleSoftCancel(billingUserId, subscriptionId) {
+  try {
+    await cancelPolarSubscription(subscriptionId, { effectiveFrom: "next_billing_period" });
+  } catch (err) {
+    if (err?.status === 404) {
+      logger.warn({ userId: billingUserId, subscriptionId }, "Subscription not found in Polar when canceling");
+      throw new AppError("Subscription not found", StatusCodes.NOT_FOUND);
+    }
+    throw err;
+  }
+
+  await updateSubscriptionStatus(billingUserId, {
+    status: SUBSCRIPTION_STATUS_CANCELLED_AT_PERIOD_END,
+    nextPlan: normalizePlan("free")
+  });
+  await cancelScheduledDowngradeJob(billingUserId);
+  return { success: true, message: "Subscription scheduled to cancel at period end" };
+}
+
+export async function handleResumeSubscription(billingUserId, subscription) {
+  const currentPlanName = getPlanName(subscription.plan);
+  const currentPlanProductId = getPlanProductId(subscription.plan);
+  const interval = subscription.interval || "monthly";
+
+  const now = new Date();
+  const trialingEndsAt = subscription.trialingEndsAt ? new Date(subscription.trialingEndsAt) : null;
+  const shouldRestoreToTrialing = !!trialingEndsAt && trialingEndsAt > now;
+
+  const productIdToRestore = currentPlanProductId || getProductIdForPlan(currentPlanName, interval);
+
+  if (productIdToRestore && currentPlanName !== "free") {
+    await updatePolarSubscription(subscription.polarSubscriptionId, {
+      cancel_at_period_end: false,
+      product_id: productIdToRestore
+    });
+  } else {
+    await updatePolarSubscription(subscription.polarSubscriptionId, { cancel_at_period_end: false });
+  }
+
+  const update = {
+    status: shouldRestoreToTrialing ? SUBSCRIPTION_STATUS_TRIALING : SUBSCRIPTION_STATUS_ACTIVE,
+    nextPlan: null,
+    trialingEndsAt: shouldRestoreToTrialing ? trialingEndsAt : null
+  };
+
+  if (currentPlanName !== "free") {
+    update.plan = currentPlanProductId
+      ? normalizePlan(currentPlanName, currentPlanProductId)
+      : normalizePlan(currentPlanName, productIdToRestore, interval, getProductIdForPlan);
+  }
+
+  await Subscription.findOneAndUpdate({ userId: billingUserId }, update, { new: true });
+  await cancelScheduledDowngradeJob(billingUserId);
+  return { success: true, message: "Subscription resumed" };
+}
+```
+
+---
+
+## Complete Client Code Sections
+
+### 1) Client query and mutation setup
+
+```typescript
+const { data: plans = [], isLoading: isLoadingPlans } = useQuery({
+  queryKey: ["subscription", "plans"],
+  queryFn: fetchSubscriptionPlans,
+  enabled: !!user,
+});
+
+const { data: currentSubscription, isLoading: isLoadingCurrent } = useQuery({
+  queryKey: ["subscription", "current", contextChannelId ?? "me"],
+  queryFn: () => fetchCurrentSubscription(contextChannelId),
+  enabled: !!user,
+});
+
+const { data: usage } = useQuery({
+  queryKey: ["subscription", "usage", contextChannelId ?? "me"],
+  queryFn: () => fetchSubscriptionUsage(contextChannelId),
+  enabled: !!user,
+});
+
+const upgradeMutation = useMutation({
+  mutationFn: (vars: { plan: string; interval: BillingInterval }) =>
+    upgradeSubscription(vars.plan, vars.interval),
+  onSuccess: async () => {
+    await queryClient.invalidateQueries({ queryKey: ["subscription"] });
+    dispatch(initializeSession());
   },
-  status: "active" | "trialing" | "cancelled_at_period_end" | "free" | "expired",
-  nextPlan: {
-    name: String,
-    productId: String
-  } | null,
-  interval: "monthly" | "yearly",
-  price: Number,  // In dollars
-  currentPeriodEnd: Date,
-  trialingEndsAt: Date | null,
-  polarSubscriptionId: String | null,
-  polarTransactionId: String | null
-}
+});
+
+const portalMutation = useMutation({
+  mutationFn: () => createBillingPortal()
+});
+
+const resumeMutation = useMutation({
+  mutationFn: () => resumeSubscription(),
+  onSuccess: async () => {
+    await queryClient.invalidateQueries({ queryKey: ['subscription'] });
+    dispatch(initializeSession());
+    toast.success('Subscription resumed. Your plan will continue as before.');
+  },
+});
 ```
 
-### Key Fields
+### 2) Client derived subscription state
 
-- **`plan`**: Current active plan (object with name and productId)
-- **`nextPlan`**: Scheduled plan change (for downgrades)
-- **`status`**: Current subscription state
-- **`trialingEndsAt`**: Trial end date (null if not trialing)
-- **`currentPeriodEnd`**: End of current billing period
-- **`polarSubscriptionId`**: Polar.sh subscription ID (null if revoked)
+```typescript
+const getPlanName = (plan: string | { name: string } | undefined): string => {
+  if (!plan) return 'free';
+  if (typeof plan === 'string') return plan;
+  if (typeof plan === 'object' && plan.name) return plan.name;
+  return 'free';
+};
 
----
+const currentPlan = getPlanName(currentSubscription?.current_plan ?? currentSubscription?.plan ?? user?.subscriptionPlan ?? 'free');
+const subscriptionStatus = (
+  currentSubscription?.subscription_status ??
+  (currentSubscription?.status === 'trialing'
+    ? 'trialing'
+    : currentSubscription?.status === 'canceled' || currentSubscription?.status === 'cancelled'
+      ? 'cancelled'
+      : 'active')
+) as SubscriptionStatus;
 
-## API Endpoints
+const nextPlanValue = currentSubscription?.next_plan ?? currentSubscription?.nextPlan ?? null;
+const nextPlan = nextPlanValue ? getPlanName(nextPlanValue) : null;
+const currentPeriodEnd = currentSubscription?.current_period_end ?? currentSubscription?.currentPeriodEnd ?? null;
+const trialingEndsAt = currentSubscription?.trialing_ends_at ?? null;
+const currentInterval = (currentSubscription?.billing_interval ?? currentSubscription?.interval ?? 'monthly') as BillingInterval;
+const trialUsedAt = currentSubscription?.trial_used_at ?? null;
+const canStartTrial = trialUsedAt == null;
+const activeDiscount = currentSubscription?.active_discount ?? null;
 
-### `POST /api/subscription/upgrade`
-
-**Request:**
-```json
-{
-  "plan": "pro" | "plus" | "agency",
-  "interval": "monthly" | "yearly"
-}
+const trialEndsAtDate = trialingEndsAt ? new Date(trialingEndsAt) : null;
+const isTrialActiveByDate = Boolean(
+  trialEndsAtDate &&
+  !Number.isNaN(trialEndsAtDate.getTime()) &&
+  trialEndsAtDate.getTime() > Date.now()
+);
+const isTrialing = subscriptionStatus === 'trialing' || isTrialActiveByDate;
+const isCancelledAtPeriodEnd = subscriptionStatus === 'cancelled_at_period_end';
 ```
 
-**Behavior:**
-- **Upgrade (paid-to-paid)**: Immediate update via Polar API
-- **Downgrade (paid-to-paid)**: Schedule for period end
-- **Trial → Different Plan**: Revoke trial, create checkout
-- **Trial → Same Plan**: Return error
-- **Free → Paid**: Create checkout
+### 3) Client upgrade action handling
 
-**Response:**
-```json
-{
-  "checkoutUrl": "https://..."  // For new subscriptions
-}
-// OR
-{
-  "currentPlan": "plus",
-  "nextPlan": "pro"  // For scheduled downgrades
-}
+```typescript
+const handleUpgrade = async (plan: Plan) => {
+  track('upgrade_clicked', { plan: plan.id, interval: billingInterval });
+  try {
+    const data = await upgradeMutation.mutateAsync({ plan: plan.id, interval: billingInterval });
+    if (data?.checkoutUrl) {
+      if (activeDiscount) {
+        track('coupon_applied_ui', { plan: plan.id, discount_target: activeDiscount.target_plan });
+      }
+      window.location.href = data.checkoutUrl;
+      return;
+    }
+    if (data?.nextPlan != null && data?.currentPlan != null) {
+      toast.success('Downgrade scheduled for next billing cycle. Your current plan stays active until then.');
+    } else {
+      toast.success(`Switched to ${plan.name} plan.`);
+    }
+  } catch {
+    toast.error('Failed to update subscription. Please try again.');
+  }
+};
+
+const handlePlanAction = async (plan: Plan) => {
+  const isFreePlan = plan.id === 'free' || plan.price === 0;
+  if (isFreePlan && currentPlan !== 'free') {
+    setPendingDowngradePlan(plan);
+    setShowSwitchToFreeConfirm(true);
+    return;
+  }
+
+  if (isTrialing && !isFreePlan && currentPlan !== plan.id) {
+    setPendingUpgradePlan(plan);
+    setShowUpgradeConfirm(true);
+    return;
+  }
+
+  await handleUpgrade(plan);
+};
 ```
 
-### `POST /api/subscription/cancel`
+### 4) Client cancel-resume-billing interactions
 
-**Behavior:**
-- Soft cancel: Sets `cancel_at_period_end: true` in Polar
-- Status: `cancelled_at_period_end`
-- `nextPlan`: `free`
-- Subscription remains active until period ends
+```typescript
+// Resume button action
+await resumeMutation.mutateAsync();
 
-### `POST /api/subscription/resume`
+// Manage billing action
+const data = await portalMutation.mutateAsync();
+window.location.href = data.url;
 
-**Behavior:**
-- Removes `cancel_at_period_end` in Polar
-- Restores status:
-  - `trialing` if trial hasn't ended
-  - `active` if trial ended or was active
-- Clears `nextPlan`
-- Cancels scheduled downgrade jobs
+// UI behavior
+// - If status is cancelled_at_period_end: show "Resume subscription"
+// - Else: show "Manage billing"
+// - For free plan: show upgrade CTA and trial availability based on trial_used_at
+```
 
 ---
 
-## Webhook Endpoints
+## Invariants and Guarantees
 
-### `POST /api/webhooks/polar`
-
-**Processing:**
-1. Verify signature using Polar webhook secret
-2. Check idempotency (prevent duplicates)
-3. Extract user ID
-4. Build next state using state machine
-5. Validate state
-6. Update database atomically
-7. Mark webhook as processed
-
-**Idempotency:**
-- Uses `event.id` or `event.timestamp` as primary key
-- Falls back to payload hash if no ID
-- Prevents duplicate processing
-
----
-
-## Job Queue
-
-### Scheduled Downgrade Job
-
-**Queue:** `scheduled-downgrade`
-**Job ID Format:** `scheduled-downgrade-{userId}`
-
-**Process:**
-1. Fetch subscription from database
-2. Verify `nextPlan` exists
-3. Fetch `currentPeriodEnd` from Polar (if DB value stale)
-4. If period not ended, reschedule job
-5. Update Polar subscription to `nextPlan`
-6. Update local database
-7. Clear `nextPlan`
-
-**Error Handling:**
-- If subscription not found → Log and complete
-- If period not ended → Reschedule
-- If Polar API error → Retry with exponential backoff
-
----
-
-## Best Practices
-
-### 1. Always Use State Machine
-
-Never update subscription state directly. Always use `buildNextSubscriptionState()` to ensure consistency.
-
-### 2. Validate Before Writing
-
-Always validate state using `validateSubscriptionState()` before writing to database.
-
-### 3. Handle Webhook Idempotency
-
-Always check if webhook was already processed before updating state.
-
-### 4. Preserve Fields Not Changed
-
-When building next state, preserve fields that aren't explicitly updated.
-
-### 5. Fetch from Polar When Needed
-
-If database value is stale or missing, fetch from Polar API as fallback.
-
-### 6. Log State Transitions
-
-Always log state transitions for debugging and audit trails.
-
-### 7. Handle Edge Cases
-
-- Check for revoked subscriptions
-- Handle stale webhooks
-- Verify period end dates
-- Check for scheduled downgrades
+1. Only workspace owner can mutate billing state.
+2. Only one effective paid subscription is allowed per billing user.
+3. Trial plan changes always revoke the trial first.
+4. Paid downgrade is deferred and represented by `nextPlan`.
+5. Cancel endpoint is soft cancel (`cancelled_at_period_end`), not revoke.
+6. Free plan selection is immediate revoke/reset.
+7. Webhook processing is idempotent and guarded against stale/revoked events.
 
 ---
 
 ## Testing Checklist
 
-When testing subscription flows, verify:
+Verify all cases before release:
 
-- [ ] Upgrade immediately updates plan
-- [ ] Downgrade schedules for period end
-- [ ] Credit webhooks don't downgrade plan
-- [ ] Scheduled downgrade applies at period end
-- [ ] Trial resume restores correct status
-- [ ] Trial plan change revokes trial
-- [ ] Stale webhooks don't reactivate revoked subscriptions
-- [ ] Scheduled downgrade cancelled on upgrade/resume/revocation
-- [ ] Period end fetched from Polar if stale
-- [ ] Same plan trial upgrade returns error
-
----
-
-## Common Pitfalls
-
-1. **Not checking for credits**: Always detect credit webhooks to prevent downgrades
-2. **Ignoring scheduled downgrades**: Check `nextPlan` before updating plan
-3. **Not preserving trial status**: Check `trialingEndsAt` when resuming
-4. **Stale period end dates**: Always verify with Polar API
-5. **Not cancelling jobs**: Cancel scheduled jobs on revocation/upgrade/resume
-6. **Direct state updates**: Always use state machine function
-7. **Missing idempotency checks**: Always check if webhook was processed
+- [ ] Free -> Paid checkout
+- [ ] Trial -> same plan (expect validation error)
+- [ ] Trial -> upgrade (revoke + checkout)
+- [ ] Trial -> downgrade (revoke + checkout)
+- [ ] Paid -> upgrade immediate with invoice proration
+- [ ] Paid -> same-tier interval change immediate with invoice proration
+- [ ] Paid -> downgrade deferred to period end
+- [ ] Cancel endpoint sets `cancelled_at_period_end`
+- [ ] Resume endpoint restores status correctly
+- [ ] Scheduled downgrade job executes and clears `nextPlan`
+- [ ] Credit `order.paid` events do not revert upgraded plan
+- [ ] Stale events do not reactivate revoked subscriptions
 
 ---
 
-## Future Enhancements
+## Known Pitfalls
 
-- Discount/coupon system integration
-- Proration calculation display
-- Subscription history/audit log
-- Multi-currency support
-- Subscription pause/resume
-- Plan change preview (showing proration)
-
----
-
-## Support
-
-For issues or questions about the subscription system:
-1. Check this documentation
-2. Review webhook logs
-3. Check state transition logs
-4. Verify Polar.sh subscription status
-5. Check database state vs Polar state
+1. Keep webhook state machine as single source of truth for event-driven transitions.
+2. Do not apply scheduled downgrades immediately in API layer.
+3. Do not overwrite active paid state with stale trialing webhooks.
+4. Reconcile `currentPeriodEnd` with Polar if DB value is missing/stale.
+5. Cancel scheduled jobs when state changes invalidate them.
+6. Keep `trialUsedAt` accurate; it controls `allowTrial` in checkout.
+7. In canonical response helpers, compare `current_plan.name` to `"free"` (not object-to-string checks).
 
 ---
 
-**Last Updated:** February 2026
-**Version:** 1.0
+**Last Updated:** February 2026  
+**Version:** 2.1
