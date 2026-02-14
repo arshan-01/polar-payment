@@ -107,6 +107,7 @@ Supported status values:
 
 Common transitions:
 
+File: `documentation-only (conceptual state flow)`
 ```text
 free -> trialing -> active
 free -> active
@@ -255,6 +256,7 @@ These code sections are intentionally complete for core flow maintenance.
 
 ### 1) Upgrade controller orchestration
 
+File: `sample-backend/src/modules/subscription/subscription.controller.js`
 ```javascript
 const upgrade = asyncHandler(async (req, res) => {
   const { billingUserId, isSharedContext } = await resolveBillingContext(req);
@@ -330,6 +332,7 @@ const upgrade = asyncHandler(async (req, res) => {
 
 ### 2) Trial change logic (service)
 
+File: `sample-backend/src/modules/subscription/subscription.payment.service.js`
 ```javascript
 export async function handleTrialToPaidTransition(
   billingUserId,
@@ -365,6 +368,7 @@ export async function handleTrialToPaidTransition(
 
 ### 3) Paid downgrade scheduling (service)
 
+File: `sample-backend/src/modules/subscription/subscription.payment.service.js`
 ```javascript
 export async function handlePaidDowngrade(
   billingUserId,
@@ -413,6 +417,7 @@ export async function handlePaidDowngrade(
 
 ### 4) Soft cancel and resume (service)
 
+File: `sample-backend/src/modules/subscription/subscription.payment.service.js`
 ```javascript
 export async function handleSoftCancel(billingUserId, subscriptionId) {
   try {
@@ -477,6 +482,7 @@ export async function handleResumeSubscription(billingUserId, subscription) {
 
 ### 1) Client query and mutation setup
 
+File: `sample-frontend/src/pages/Subscription.tsx`
 ```typescript
 const { data: plans = [], isLoading: isLoadingPlans } = useQuery({
   queryKey: ["subscription", "plans"],
@@ -521,6 +527,7 @@ const resumeMutation = useMutation({
 
 ### 2) Client derived subscription state
 
+File: `sample-frontend/src/pages/Subscription.tsx`
 ```typescript
 const getPlanName = (plan: string | { name: string } | undefined): string => {
   if (!plan) return 'free';
@@ -560,6 +567,7 @@ const isCancelledAtPeriodEnd = subscriptionStatus === 'cancelled_at_period_end';
 
 ### 3) Client upgrade action handling
 
+File: `sample-frontend/src/pages/Subscription.tsx`
 ```typescript
 const handleUpgrade = async (plan: Plan) => {
   track('upgrade_clicked', { plan: plan.id, interval: billingInterval });
@@ -602,6 +610,7 @@ const handlePlanAction = async (plan: Plan) => {
 
 ### 4) Client cancel-resume-billing interactions
 
+File: `sample-frontend/src/pages/Subscription.tsx`
 ```typescript
 // Resume button action
 await resumeMutation.mutateAsync();
