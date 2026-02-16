@@ -41,6 +41,8 @@ It reflects the refactored implementation used in `sample-backend` and is intend
     - [2) Trial change logic (service)](#2-trial-change-logic-service)
     - [3) Paid downgrade scheduling (service)](#3-paid-downgrade-scheduling-service)
     - [4) Soft cancel and resume (service)](#4-soft-cancel-and-resume-service)
+    - [5) Webhook transition service (extracted domain state machine)](#5-webhook-transition-service-extracted-domain-state-machine)
+    - [6) Webhook idempotency service (extracted replay guard)](#6-webhook-idempotency-service-extracted-replay-guard)
   - [Complete Client Code Sections](#complete-client-code-sections)
     - [1) Client query and mutation setup](#1-client-query-and-mutation-setup)
     - [2) Client derived subscription state](#2-client-derived-subscription-state)
@@ -61,6 +63,11 @@ Use these files as the source of truth:
 - `sample-backend/src/modules/subscription/subscription.persistence.js`
 - `sample-backend/src/modules/subscription/subscription.constants.js`
 - `sample-backend/src/modules/webhook/webhook.controller.js`
+- `sample-backend/src/modules/webhook/webhook.transition.service.js`
+- `sample-backend/src/modules/webhook/webhook.idempotency.service.js`
+- `sample-backend/src/modules/webhook/webhookEvent.model.js`
+- `sample-backend/src/config/env.schema.js` (for `WEBHOOK_EVENT_TTL_SECONDS`)
+- `sample-backend/src/config/env.js` (mapped runtime config value)
 - `sample-backend/src/services/scheduledDowngrade.js`
 
 **Discount system files:**
@@ -236,6 +243,12 @@ Core processing pipeline:
 5. Validate invariants with `validateSubscriptionState`.
 6. Write state atomically.
 7. Mark event processed.
+
+Idempotency retention:
+
+- Processed webhook events are stored in `WebhookEvent`.
+- A TTL index expires old idempotency records using `processedAt`.
+- Retention is configured via `WEBHOOK_EVENT_TTL_SECONDS` (default: 90 days).
 
 Credit/rollback guard during upgrades:
 
@@ -926,6 +939,435 @@ export async function handleResumeSubscription(billingUserId, subscription) {
 }
 ```
 
+### 5) Webhook transition service (extracted domain state machine)
+
+File: `sample-backend/src/modules/webhook/webhook.transition.service.js`
+```javascript
+/**
+ * Validate subscription state invariants before write
+ * @param {object} state - Subscription state to validate
+ * @returns {object} { valid: boolean, error: string|null }
+ */
+function validateSubscriptionState(state, deps) {
+  const { getPlanName } = deps;
+  const planName = state.plan ? getPlanName(state.plan) : "free";
+  const status = state.status;
+  const polarSubscriptionId = state.polarSubscriptionId;
+  const price = state.price;
+
+  if (status === "active" && planName !== "free" && !polarSubscriptionId) {
+    return {
+      valid: false,
+      error: `Invalid state: active paid plan (${planName}) must have polarSubscriptionId`
+    };
+  }
+
+  if (planName === "free" || status === "free") {
+    if (price !== 0 && price !== null && price !== undefined) {
+      return {
+        valid: false,
+        error: `Invalid state: free plan must have price = 0, got ${price}`
+      };
+    }
+    if (polarSubscriptionId !== null && polarSubscriptionId !== undefined) {
+      return {
+        valid: false,
+        error: "Invalid state: free plan must have polarSubscriptionId = null"
+      };
+    }
+  }
+
+  if (status === "cancelled_at_period_end") {
+    if (!polarSubscriptionId) {
+      return {
+        valid: false,
+        error: "Invalid state: cancelled_at_period_end must have polarSubscriptionId"
+      };
+    }
+    if (!state.currentPeriodEnd) {
+      return {
+        valid: false,
+        error: "Invalid state: cancelled_at_period_end must have currentPeriodEnd"
+      };
+    }
+  }
+
+  return { valid: true, error: null };
+}
+
+/**
+ * Build next subscription state from current state and webhook event
+ * This is the single source of truth for state transitions
+ * @param {object} currentState - Current subscription state from DB
+ * @param {string} eventType - Webhook event type
+ * @param {object} eventData - Webhook event data
+ * @param {object} derived - Derived values (plan, interval, price, etc.)
+ * @returns {object} Next subscription state
+ */
+function buildNextSubscriptionState(currentState, eventType, eventData, derived, deps) {
+  const {
+    getPlanName,
+    getProductIdForPlan,
+    normalizePlan,
+    getEffectivePrice
+  } = deps;
+  const {
+    plan,
+    interval,
+    productId,
+    price: webhookPrice,
+    currentPeriodEnd,
+    trialingEndsAt,
+    incomingPolarSubscriptionId
+  } = derived;
+
+  const existingPlanName = currentState?.plan ? getPlanName(currentState.plan) : null;
+  const existingStatus = currentState?.status;
+  const existingNextPlanName = currentState?.nextPlan ? getPlanName(currentState.nextPlan) : null;
+
+  const nextState = {
+    ...(currentState || {}),
+    _id: undefined,
+    __v: undefined
+  };
+
+  if (eventType === "order.paid") {
+    const planObject = normalizePlan(plan, productId, interval, getProductIdForPlan);
+    const subscriptionStatusFromOrder = eventData?.subscription?.status ?? null;
+    const isTrialOrder = subscriptionStatusFromOrder === "trialing";
+    const orderTrialEnd =
+      eventData?.subscription?.trial_end != null ? new Date(eventData.subscription.trial_end) : null;
+    const isZeroPrice = webhookPrice === null || webhookPrice === 0;
+
+    const PLAN_HIERARCHY = { free: 0, pro: 1, plus: 2, agency: 3 };
+    const incomingPlanName = plan ? getPlanName(planObject) : null;
+    const currentTier = existingPlanName ? (PLAN_HIERARCHY[existingPlanName] ?? 0) : 0;
+    const incomingTier = incomingPlanName ? (PLAN_HIERARCHY[incomingPlanName] ?? 0) : 0;
+    const isDowngrade = incomingTier > 0 && currentTier > 0 && incomingTier < currentTier;
+    const isCredit = (webhookPrice !== null && webhookPrice < 0) || (isDowngrade && existingPlanName !== null);
+
+    const shouldApplyNextPlan =
+      !isZeroPrice && !isCredit && existingNextPlanName && String(existingNextPlanName) === String(plan);
+
+    const hasScheduledDowngrade = existingNextPlanName && existingNextPlanName !== "free";
+    const periodEnd = currentState?.currentPeriodEnd ? new Date(currentState.currentPeriodEnd) : null;
+    const now = new Date();
+    const periodNotEnded = periodEnd && periodEnd > now;
+    const shouldPreserveCurrentPlan = hasScheduledDowngrade && periodNotEnded && !shouldApplyNextPlan;
+
+    const shouldUpdatePlan = !shouldPreserveCurrentPlan && !isCredit;
+
+    if (shouldUpdatePlan) {
+      nextState.plan = planObject;
+      nextState.interval = interval ?? undefined;
+    }
+
+    const isScheduledToCancel = existingStatus === "cancelled_at_period_end";
+    const periodEndForCancel = currentState?.currentPeriodEnd ? new Date(currentState.currentPeriodEnd) : null;
+    const cancelPeriodNotEnded = periodEndForCancel && periodEndForCancel > now;
+    const shouldPreserveCancellation = isScheduledToCancel && cancelPeriodNotEnded;
+
+    if (!shouldPreserveCancellation) {
+      nextState.status = isTrialOrder ? "trialing" : "active";
+    } else {
+      nextState.status = "cancelled_at_period_end";
+    }
+
+    nextState.trialingEndsAt = isTrialOrder
+      ? (trialingEndsAt ?? orderTrialEnd ?? currentState?.trialingEndsAt ?? null)
+      : null;
+
+    if (shouldPreserveCurrentPlan || isCredit) {
+      // Keep existing price when preserving the current plan or when this event is a credit.
+    } else if (isTrialOrder) {
+      nextState.price = 0;
+    } else if (webhookPrice !== null && Number.isFinite(webhookPrice) && webhookPrice > 0) {
+      nextState.price = webhookPrice;
+    } else {
+      const planName = getPlanName(planObject);
+      nextState.price = getEffectivePrice(planName, interval);
+    }
+
+    const subscriptionId = eventData?.subscription_id ?? eventData?.subscription?.id ?? incomingPolarSubscriptionId;
+    if (subscriptionId) {
+      nextState.polarSubscriptionId = subscriptionId;
+    }
+    if (eventData?.id) {
+      nextState.polarTransactionId = eventData.id;
+    }
+    if (currentPeriodEnd) {
+      nextState.currentPeriodEnd = currentPeriodEnd;
+    }
+    if (shouldApplyNextPlan) {
+      nextState.nextPlan = null;
+    }
+    if (shouldPreserveCancellation && currentState?.nextPlan) {
+      nextState.nextPlan = currentState.nextPlan;
+    }
+  } else if (eventType === "subscription.created") {
+    if (incomingPolarSubscriptionId) {
+      nextState.polarSubscriptionId = incomingPolarSubscriptionId;
+    }
+    if (plan) {
+      const planObject = normalizePlan(plan, productId, interval, getProductIdForPlan);
+      const planName = getPlanName(planObject);
+      nextState.plan = planObject;
+      nextState.interval = interval ?? undefined;
+
+      const hasTrialInCreated =
+        eventData?.status === "trialing" ||
+        !!trialingEndsAt ||
+        !!eventData?.trial_end ||
+        !!eventData?.trial_start;
+
+      if (planName !== "free") {
+        nextState.status = hasTrialInCreated ? "trialing" : "active";
+      }
+
+      if (hasTrialInCreated) {
+        if (trialingEndsAt) {
+          nextState.trialingEndsAt = trialingEndsAt;
+        }
+        nextState.price = 0;
+      }
+    }
+    if (currentPeriodEnd) {
+      nextState.currentPeriodEnd = currentPeriodEnd;
+    }
+    if (nextState.status !== "trialing" && webhookPrice !== null && Number.isFinite(webhookPrice) && webhookPrice > 0) {
+      nextState.price = webhookPrice;
+    } else if (nextState.status !== "trialing" && plan) {
+      const planName = getPlanName(normalizePlan(plan, productId, interval, getProductIdForPlan));
+      nextState.price = getEffectivePrice(planName, interval);
+    }
+  } else if (eventType === "subscription.updated" && eventData?.status === "trialing") {
+    if (existingStatus !== "active") {
+      nextState.status = "trialing";
+      nextState.trialingEndsAt = trialingEndsAt ?? currentPeriodEnd ?? currentState?.trialingEndsAt ?? null;
+      if (incomingPolarSubscriptionId) {
+        nextState.polarSubscriptionId = incomingPolarSubscriptionId;
+      }
+      if (plan) {
+        nextState.plan = normalizePlan(plan, productId, interval, getProductIdForPlan);
+        nextState.interval = interval ?? undefined;
+      } else if (currentState?.plan) {
+        nextState.plan = normalizePlan(currentState.plan, null, currentState?.interval ?? interval, getProductIdForPlan);
+        nextState.interval = nextState.interval ?? currentState?.interval ?? undefined;
+      }
+    }
+  } else if (eventType === "subscription.canceled" || eventType === "subscription.cancelled") {
+    const endsAt = eventData?.ends_at ?? eventData?.current_period_end ?? null;
+    const periodEndDate = endsAt ? new Date(endsAt) : (currentPeriodEnd ? new Date(currentPeriodEnd) : null);
+    const now = new Date();
+    const endsInFuture = periodEndDate && periodEndDate > now;
+
+    if (endsInFuture) {
+      nextState.status = "cancelled_at_period_end";
+      nextState.nextPlan = normalizePlan("free");
+      nextState.currentPeriodEnd = periodEndDate ?? currentPeriodEnd ?? null;
+      if (incomingPolarSubscriptionId) {
+        nextState.polarSubscriptionId = incomingPolarSubscriptionId;
+      }
+    } else {
+      nextState.plan = normalizePlan("free");
+      nextState.status = "free";
+      nextState.nextPlan = null;
+      nextState.price = 0;
+      nextState.currentPeriodEnd = null;
+      nextState.trialingEndsAt = null;
+      nextState.polarSubscriptionId = null;
+      nextState.polarTransactionId = null;
+    }
+  } else if (eventType === "subscription.updated" && eventData?.status !== "trialing") {
+    const cancelAtPeriodEnd = eventData?.cancel_at_period_end === true;
+
+    if (cancelAtPeriodEnd) {
+      const endsAt = eventData?.ends_at ?? eventData?.current_period_end ?? null;
+      const periodEndDate = endsAt ? new Date(endsAt) : (currentPeriodEnd ? new Date(currentPeriodEnd) : null);
+      const now = new Date();
+      const endsInFuture = periodEndDate && periodEndDate > now;
+
+      if (endsInFuture) {
+        nextState.status = "cancelled_at_period_end";
+        nextState.nextPlan = normalizePlan("free");
+        nextState.currentPeriodEnd = periodEndDate ?? currentPeriodEnd ?? null;
+        if (incomingPolarSubscriptionId) {
+          nextState.polarSubscriptionId = incomingPolarSubscriptionId;
+        }
+      }
+    } else if (eventData?.status === "active" && incomingPolarSubscriptionId) {
+      nextState.status = "active";
+      nextState.trialingEndsAt = null;
+      nextState.polarSubscriptionId = incomingPolarSubscriptionId;
+      if (currentPeriodEnd) {
+        nextState.currentPeriodEnd = currentPeriodEnd;
+      }
+      if (webhookPrice !== null && Number.isFinite(webhookPrice) && webhookPrice > 0) {
+        nextState.price = webhookPrice;
+      }
+      const existingNextPlanNameInner = currentState?.nextPlan ? getPlanName(currentState.nextPlan) : null;
+      if (!existingNextPlanNameInner || !["pro", "plus", "agency"].includes(existingNextPlanNameInner)) {
+        nextState.nextPlan = null;
+      }
+    }
+  } else if (eventType === "subscription.active") {
+    const hasTrialSignal =
+      eventData?.status === "trialing" ||
+      !!trialingEndsAt ||
+      !!eventData?.trial_end ||
+      !!eventData?.trial_start ||
+      existingStatus === "trialing";
+
+    nextState.status = hasTrialSignal ? "trialing" : "active";
+    nextState.nextPlan = null;
+    nextState.trialingEndsAt = hasTrialSignal ? (trialingEndsAt ?? currentState?.trialingEndsAt ?? null) : null;
+    if (incomingPolarSubscriptionId) {
+      nextState.polarSubscriptionId = incomingPolarSubscriptionId;
+    }
+    if (currentPeriodEnd) {
+      nextState.currentPeriodEnd = currentPeriodEnd;
+    }
+    if (!hasTrialSignal && webhookPrice !== null && Number.isFinite(webhookPrice) && webhookPrice > 0) {
+      nextState.price = webhookPrice;
+    } else if (hasTrialSignal) {
+      nextState.price = 0;
+    }
+  } else if (eventType === "subscription.uncanceled") {
+    const now = new Date();
+    const existingTrialingEndsAt = currentState?.trialingEndsAt ? new Date(currentState.trialingEndsAt) : null;
+    const wasTrialing = !!existingTrialingEndsAt;
+    const trialNotEnded = existingTrialingEndsAt && existingTrialingEndsAt > now;
+    const shouldRestoreToTrialing = wasTrialing && trialNotEnded;
+
+    nextState.status = shouldRestoreToTrialing ? "trialing" : "active";
+    nextState.nextPlan = null;
+
+    if (shouldRestoreToTrialing) {
+      nextState.trialingEndsAt = existingTrialingEndsAt;
+      nextState.price = 0;
+    } else {
+      nextState.trialingEndsAt = null;
+      if (webhookPrice !== null && Number.isFinite(webhookPrice) && webhookPrice > 0) {
+        nextState.price = webhookPrice;
+      }
+    }
+
+    if (incomingPolarSubscriptionId) {
+      nextState.polarSubscriptionId = incomingPolarSubscriptionId;
+    }
+    if (currentPeriodEnd) {
+      nextState.currentPeriodEnd = currentPeriodEnd;
+    }
+  } else if (eventType === "subscription.revoked") {
+    nextState.plan = normalizePlan("free");
+    nextState.status = "free";
+    nextState.nextPlan = null;
+    nextState.price = 0;
+    nextState.currentPeriodEnd = null;
+    nextState.trialingEndsAt = null;
+    nextState.polarSubscriptionId = null;
+    nextState.polarTransactionId = null;
+  }
+
+  if (nextState.status === "trialing" && !nextState.trialingEndsAt && nextState.currentPeriodEnd) {
+    nextState.trialingEndsAt = nextState.currentPeriodEnd;
+  }
+
+  Object.keys(nextState).forEach((key) => {
+    if (nextState[key] === undefined) {
+      delete nextState[key];
+    }
+  });
+
+  return nextState;
+}
+
+export { validateSubscriptionState, buildNextSubscriptionState };
+```
+
+### 6) Webhook idempotency service (extracted replay guard)
+
+File: `sample-backend/src/modules/webhook/webhook.idempotency.service.js`
+```javascript
+import crypto from "crypto";
+
+/**
+ * Generate unique event key for idempotency.
+ * Prefer provider event identity (event.id/event.timestamp). Fallback to
+ * payload-derived hash only when provider identity is unavailable.
+ */
+function getEventKey(eventType, eventId, eventData = null) {
+  if (eventId) {
+    return `${eventType}:${eventId}`;
+  }
+  if (eventData) {
+    const payloadKey = {
+      dataId: eventData?.id ?? null,
+      created_at: eventData?.created_at ?? null,
+      modified_at: eventData?.modified_at ?? null,
+      status: eventData?.status ?? null,
+      cancel_at_period_end: eventData?.cancel_at_period_end ?? null,
+      ends_at: eventData?.ends_at ?? null
+    };
+    const payloadHash = crypto
+      .createHash("md5")
+      .update(JSON.stringify(payloadKey))
+      .digest("hex")
+      .substring(0, 12);
+    return `${eventType}:payload:${payloadHash}`;
+  }
+  return `${eventType}:unknown`;
+}
+
+/**
+ * Check if webhook event was already processed (idempotency)
+ * @returns {object|null} Existing event record or null
+ */
+async function checkEventIdempotency(eventType, eventId, eventData = null, deps = {}) {
+  const { webhookEventModel, loggerInstance } = deps;
+  if (!webhookEventModel) {
+    throw new Error("webhookEventModel is required for checkEventIdempotency");
+  }
+  const eventKey = getEventKey(eventType, eventId, eventData);
+  try {
+    const existing = await webhookEventModel.findOne({ eventKey }).lean();
+    return existing;
+  } catch (err) {
+    loggerInstance?.error?.({ err, eventKey }, "Error checking webhook idempotency");
+    return null;
+  }
+}
+
+/**
+ * Mark webhook event as processed
+ */
+async function markEventProcessed(eventType, eventId, userId, previousState, nextState, eventData = null, deps = {}) {
+  const { webhookEventModel, loggerInstance } = deps;
+  if (!webhookEventModel) {
+    throw new Error("webhookEventModel is required for markEventProcessed");
+  }
+  const eventKey = getEventKey(eventType, eventId, eventData);
+  try {
+    await webhookEventModel.create({
+      eventKey,
+      eventType,
+      eventId: eventId || "unknown",
+      userId: userId || null,
+      previousState: previousState ? JSON.parse(JSON.stringify(previousState)) : null,
+      nextState: nextState ? JSON.parse(JSON.stringify(nextState)) : null
+    });
+  } catch (err) {
+    if (err.code === 11000) {
+      loggerInstance?.warn?.({ eventKey }, "Webhook event already marked as processed");
+    } else {
+      loggerInstance?.error?.({ err, eventKey }, "Error marking webhook event as processed");
+    }
+  }
+}
+
+export { getEventKey, checkEventIdempotency, markEventProcessed };
+```
+
 ---
 
 ## Complete Client Code Sections
@@ -1122,6 +1564,9 @@ Verify all cases before release:
 - [ ] Discount webhook reconciliation: handles both internal and Polar discount IDs
 - [ ] Discount expiry cleanup: marks expired discounts
 - [ ] Discount reconciliation job: detects and reconciles state drift
+- [ ] Unit tests for webhook transition service pass (`webhook.transition.service.test.js`)
+- [ ] Unit tests for webhook idempotency service pass (`webhook.idempotency.service.test.js`)
+- [ ] Env schema tests cover webhook TTL default and override (`env.schema.test.js`)
 
 ---
 
@@ -1139,8 +1584,9 @@ Verify all cases before release:
 10. Discount attachment must verify `restrict_to` matches selected plan.
 11. Discount reconciliation must handle both `discountId` and `discount_id` paths.
 12. Expired discounts are marked as expired (status change), not deleted.
+13. Keep `WEBHOOK_EVENT_TTL_SECONDS` long enough to cover realistic webhook replay windows.
 
 ---
 
 **Last Updated:** February 2026
-**Version:** 2.2
+**Version:** 2.3
