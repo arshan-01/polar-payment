@@ -8,6 +8,7 @@ It reflects the refactored implementation used in `sample-backend` and is intend
 - [Subscription \& Payment System Documentation](#subscription--payment-system-documentation)
   - [Table of Contents](#table-of-contents)
   - [Canonical Code Layout](#canonical-code-layout)
+    - [Complete Module Inventory (1:1 with server structure)](#complete-module-inventory-11-with-server-structure)
   - [Client Architecture and Structure](#client-architecture-and-structure)
     - [Main client file](#main-client-file)
     - [Client state model](#client-state-model)
@@ -83,6 +84,41 @@ Use these files as the source of truth:
 - `sample-backend/src/services/discountService.js`
 
 If `legacy-backend/` also exists in this repo, treat it as legacy/mirror unless explicitly chosen as runtime target.
+
+### Complete Module Inventory (1:1 with server structure)
+
+Use this section as the exhaustive module-level map for current backend structure.
+
+**Subscription module (`sample-backend/src/modules/subscription/`):**
+- `subscription.constants.js`
+- `subscription.controller.js`
+- `subscription.model.js`
+- `subscription.payment.service.js`
+- `subscription.persistence.js`
+- `subscription.route.js`
+- `subscription.schema.js`
+
+**Webhook module (`sample-backend/src/modules/webhook/`):**
+- `webhook.controller.js`
+- `webhook.idempotency.service.js`
+- `webhook.route.js`
+- `webhook.transition.service.js`
+- `webhookEvent.model.js`
+
+**Discount module (`sample-backend/src/modules/discount/`):**
+- `discount.checkout.js`
+- `discount.constants.js`
+- `discount.controller.js`
+- `discount.eligibility.js`
+- `discount.lifecycle.js`
+- `discount.metrics.js`
+- `discount.model.js`
+- `discount.orchestrator.js`
+- `discount.persistence.js`
+- `discount.polar.js`
+- `discount.reconciliation.job.js`
+- `discount.reconciliation.js`
+- `discount.route.js`
 
 ---
 
